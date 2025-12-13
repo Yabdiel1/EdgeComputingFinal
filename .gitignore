@@ -1,0 +1,89 @@
+# =========================
+# Python artifacts
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python packaging
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# =========================
+# MPI / Runtime artifacts
+# =========================
+*.log
+mpi_*.out
+mpi_*.err
+
+# =========================
+# NumPy / Scientific computing
+# =========================
+*.npy
+*.npz
+
+# =========================
+# OS-specific files
+# =========================
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+
+# =========================
+# IDE / Editor files
+# =========================
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+
+# =========================
+# Test / coverage artifacts
+# =========================
+.coverage
+htmlcov/
+.pytest_cache/
+
+# =========================
+# Jupyter notebooks
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Temporary / scratch files
+# =========================
+*.tmp
+*.swp
+*.bak
+
+# =========================
+# Project-specific
+# =========================
+# Performance output / benchmark results
+benchmarks/
+results/
+
+# Ignore local config overrides
+config.local.py
