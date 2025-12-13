@@ -243,54 +243,56 @@ def run_all_tests():
         print(f"Running with {comm.Get_size()} processes")
         print("=" * 60)
     
-    # Run tests
     test_results = []
-    
+
     # Test 1: Validation
     if rank == 0:
         print("\n1. Testing input validation...")
     comm.Barrier()
     test_results.append(test_validation())
-    
+
     # Test 2: Data distribution
     if rank == 0:
         print("\n2. Testing data distribution...")
     comm.Barrier()
     test_results.append(test_distribution())
-    
-    # Test 3: Parallel vs Serial comparison
+
+    # Test 3: Small correctness test
     if rank == 0:
-        print("\n3. Testing parallel vs serial FFT...")
+        print("\n3. Testing parallel vs serial FFT (small)...")
     comm.Barrier()
     test_results.append(test_parallel_vs_serial_small())
-    
-    # Test 4: Benchmark
+
+    # Test 4: Large correctness test (NEW)
     if rank == 0:
-        print("\n4. Benchmarking performance...")
+        print("\n4. Testing parallel vs NumPy FFT (large inputs)...")
+    comm.Barrier()
+    test_results.append(test_parallel_vs_numpy_multi_size())
+
+    # Test 5: Benchmark
+    if rank == 0:
+        print("\n5. Benchmarking performance...")
     comm.Barrier()
     test_results.append(test_benchmark())
-    
-    # Collect results
+
+    # Gather results
     all_results = comm.gather(test_results, root=0)
-    
+
     if rank == 0:
-        # Flatten results
-        flat_results = []
-        for proc_results in all_results:
-            flat_results.extend(proc_results)
-        
-        # Check if all tests passed
+        flat_results = [r for proc in all_results for r in proc]
         all_passed = all(flat_results)
-        
+
         print("\n" + "=" * 60)
         if all_passed:
-            print("ALL PARALLEL TESTS PASSED!")
+            print("ALL PARALLEL TESTS PASSED ✅")
         else:
-            print("SOME TESTS FAILED")
+            print("SOME TESTS FAILED ❌")
         print("=" * 60)
-        
+
         return all_passed
+
     return True
+
 
 if __name__ == "__main__":
     # Note: This must be run with MPI
