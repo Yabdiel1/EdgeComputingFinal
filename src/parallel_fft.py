@@ -4,14 +4,33 @@ from typing import Optional, Tuple
 
 class ParallelFFT:
     """
-    Parallel FFT implementation using MPI (Transpose-Split / Four-Step Method).
+    Parallel FFT implementation using MPI (Four-Step Method with CORRECT indexing).
     Requires N to be divisible by P^2.
+    
+    KEY FIX: Uses COLUMN-MAJOR indexing (n = m*P + p) instead of row-major!
     """
 
-    def __init__(self, comm: Optional[MPI.Intracomm] = None):
+    def __init__(self, comm: Optional[MPI.Intracomm] = None, debug: bool = False):
         self.comm = comm or MPI.COMM_WORLD
         self.rank = self.comm.Get_rank()
         self.size = self.comm.Get_size()
+        self.debug = debug
+
+    def _debug_print(self, message: str, force_all: bool = False):
+        """Print debug message with rank prefix"""
+        if self.debug:
+            if force_all or self.rank == 0:
+                print(f"[Rank {self.rank}] {message}")
+                
+    def _debug_barrier(self, message: str = ""):
+        """Synchronize and print message from rank 0"""
+        if self.debug:
+            self.comm.Barrier()
+            if self.rank == 0 and message:
+                print(f"\n{'='*70}")
+                print(message)
+                print('='*70)
+            self.comm.Barrier()
 
     def validate_input_size(self, n: int) -> bool:
         """
@@ -20,31 +39,21 @@ class ParallelFFT:
         """
         return (n & (n - 1) == 0) and (n % (self.size * self.size) == 0)
 
-    def distribute_data(self, x: np.ndarray) -> np.ndarray:
-        """Scatter input data across processes."""
-        n = len(x)
-        local_n = n // self.size
-        local_data = np.zeros(local_n, dtype=np.complex128)
-        # Use DOUBLE_COMPLEX for np.complex128
-        self.comm.Scatter([x, MPI.DOUBLE_COMPLEX], [local_data, MPI.DOUBLE_COMPLEX], root=0)
-        return local_data
-
     def parallel_fft(self, x: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
         """
-        Parallel 1D FFT using the Four-Step algorithm.
+        Parallel 1D FFT using the Four-Step algorithm with CORRECT indexing.
         
-        Algorithm for N-point FFT with P processes (requires N = P * L where L = P * M):
-        Input index: n = i * L + j where i in [0,P), j in [0,L)
-        Output index: k = k1 * L + k2 where k1 in [0,P), k2 in [0,L)
+        CRITICAL: Input is reshaped in COLUMN-MAJOR order (Fortran-style)
+        This means: n = m*P + p (not p*M + m)
         
-        X[k] = X[k1*L + k2] = sum_{i=0}^{P-1} sum_{j=0}^{L-1} x[i*L+j] * W_N^{(i*L+j)*(k1*L+k2)}
-        
-        Four steps:
-        1. Local FFT over j: Y[i,k2] = sum_j x[i,j] * W_L^{j*k2}
-        2. Twiddle: Z[i,k2] = Y[i,k2] * W_N^{i*k2}
-        3. Transpose: Z'[k2,i] = Z[i,k2]
-        4. Local FFT over i: X[k2,k1] = sum_i Z'[k2,i] * W_P^{i*k1}
-        Output: X[k1*L + k2]
+        Algorithm:
+        1. Reshape input as P×M matrix in COLUMN-MAJOR order
+        2. Each process gets one row (M elements)
+        3. Local FFT of length M on each row
+        4. Apply twiddle factors W_N^(p*k2)
+        5. Transpose via Alltoall
+        6. Local FFT of length P on each column
+        7. Gather and reorder using k = k1*M + k2
         """
         # --- Setup ---
         if self.rank == 0:
@@ -52,66 +61,109 @@ class ParallelFFT:
                 raise ValueError("Root process must provide input array")
             n = len(x)
             if not self.validate_input_size(n):
-                raise ValueError(f"Input size {n} must be power of 2 and divisible by P^2={self.size**2}")
+                raise ValueError(
+                    f"Input size {n} must be power of 2 and divisible by P^2={self.size**2}"
+                )
+            if self.debug:
+                print(f"\n{'='*70}")
+                print(f"PARALLEL FFT (CORRECTED - COLUMN-MAJOR)")
+                print(f"{'='*70}")
+                print(f"Input: {x}")
+                if n <= 16:
+                    print(f"Expected: {np.fft.fft(x)}")
         else:
             n = None
 
         n = self.comm.bcast(n, root=0)
         P = self.size
-        L = n // P
+        M = n // P
+        block = M // P
         
-        # --- Distribute: Each process gets row i (elements [i*L, ..., i*L+L-1]) ---
-        local_data = np.zeros(L, dtype=np.complex128)
+        if M % P != 0:
+            raise ValueError(f"M={M} must be divisible by P={P}")
+        
+        self._debug_barrier(f"CONFIGURATION: N={n}, P={P}, M={M}, block={block}")
+        
+        # --- Step 1: Reshape in COLUMN-MAJOR order and distribute ---
+        self._debug_barrier("STEP 1: Reshape (COLUMN-MAJOR) and distribute")
+        
         if self.rank == 0:
-            self.comm.Scatter([x, MPI.DOUBLE_COMPLEX], [local_data, MPI.DOUBLE_COMPLEX], root=0)
+            # CRITICAL: Reshape in Fortran (column-major) order!
+            # This means matrix[p, m] = x[m*P + p]
+            matrix = x.reshape((P, M), order='F')
+            if self.debug and n <= 16:
+                print("Matrix (column-major):")
+                print(matrix)
+                print("\nIndex mapping verification:")
+                for p in range(min(P, 2)):
+                    for m in range(min(M, 4)):
+                        n_idx = m * P + p
+                        print(f"  x[{n_idx}] = matrix[{p},{m}] = {matrix[p,m]}")
         else:
-            self.comm.Scatter(None, [local_data, MPI.DOUBLE_COMPLEX], root=0)
+            matrix = None
+        
+        # Scatter rows
+        local_data = np.zeros(M, dtype=np.complex128)
 
-        # --- Step 1: Local FFT of length L ---
-        # Process rank holds x[rank*L : rank*L+L]
-        # Compute Y[rank, k2] = FFT_L(x[rank, :])
+        if self.rank == 0:
+            sendbuf = np.empty((P, M), dtype=np.complex128)
+            for p in range(P):
+                sendbuf[p, :] = matrix[p, :]
+        else:
+            sendbuf = None
+
+        self.comm.Scatter(
+            [sendbuf, MPI.DOUBLE_COMPLEX],
+            [local_data, MPI.DOUBLE_COMPLEX],
+            root=0
+        )
+
+        
+        self._debug_print(f"Row {self.rank}: {local_data}", force_all=True)
+        
+        # --- Step 2: Local FFT of length M ---
+        self._debug_barrier("STEP 2: Local Row FFTs (length M)")
+        
         Y = np.fft.fft(local_data)
         
-        # --- Step 2: Apply twiddle factors W_N^{i*k2} ---
-        # i = self.rank, k2 = 0, 1, ..., L-1
-        i = self.rank
-        k2_indices = np.arange(L)
-        twiddles = np.exp(-2j * np.pi * i * k2_indices / n)
+        self._debug_print(f"After FFT: {Y}", force_all=True)
+        
+        # --- Step 3: Apply twiddle factors W_N^(p*k2) ---
+        self._debug_barrier("STEP 3: Apply Twiddle Factors W_N^(p*k2)")
+        
+        p = self.rank
+        k2_indices = np.arange(M)
+        twiddles = np.exp(-2j * np.pi * p * k2_indices / n)
         Z = Y * twiddles
         
-        # --- Step 3: Transpose (All-to-All) ---
-        # We need to transpose from (i, k2) to (k2, i) layout
-        # Process rank currently holds Z[rank, 0:L]
-        # After transpose, process rank should hold Z[rank*block : (rank+1)*block, 0:P]
-        # where block = L // P
+        if self.debug and M <= 8:
+            self._debug_print(f"Twiddle factors (p={p}): {twiddles}", force_all=True)
+        self._debug_print(f"After twiddle: {Z}", force_all=True)
         
-        block = L // P
-        if L % P != 0:
-            raise ValueError(f"L={L} must be divisible by P={P}")
+        # --- Step 4: Transpose (Alltoall) ---
+        self._debug_barrier("STEP 4: Transpose via Alltoall")
         
-        # Reshape: Z is currently a 1D array of length L
-        # We want to send chunk [k*block : (k+1)*block] to process k
-        sendbuf = Z.reshape(P, block).copy()  # Shape: (P, block)
+        sendbuf = Z.reshape(P, block).copy()
         recvbuf = np.empty((P, block), dtype=np.complex128)
+        
+        if self.debug and block <= 4:
+            self._debug_print(f"Send buffer:\n{sendbuf}", force_all=True)
         
         self.comm.Alltoall([sendbuf, MPI.DOUBLE_COMPLEX], [recvbuf, MPI.DOUBLE_COMPLEX])
         
-        # After Alltoall:
-        # recvbuf[i, m] came from process i, positions [rank*block + m]
-        # This is Z[i, rank*block + m] in the original (i, k2) indexing
-        # Which represents the element for row i, column (rank*block + m)
+        if self.debug and block <= 4:
+            self._debug_print(f"Receive buffer:\n{recvbuf}", force_all=True)
         
-        # --- Step 4: Local FFT of length P ---
-        # We now have P values for each of our "columns" (values of k2 in our range)
-        # recvbuf has shape (P, block) where axis-0 is the i index
-        # We need FFT along axis-0
-        X_local = np.fft.fft(recvbuf, axis=0)  # Shape: (P, block)
+        # --- Step 5: Local FFT of length P ---
+        self._debug_barrier("STEP 5: Local Column FFTs (length P)")
         
-        # X_local[k1, m] is the FFT output for:
-        #   k1 in [0, P), m in [0, block)
-        #   This corresponds to output index k = k1 * L + (rank * block + m)
+        X_local = np.fft.fft(recvbuf, axis=0)
         
-        # --- Step 5: Gather ---
+        self._debug_print(f"After column FFT:\n{X_local}", force_all=True)
+        
+        # --- Step 6: Gather and Reorder ---
+        self._debug_barrier("STEP 6: Gather and Reorder")
+        
         if self.rank == 0:
             gather_buf = np.empty((P, P, block), dtype=np.complex128)
         else:
@@ -120,32 +172,105 @@ class ParallelFFT:
         self.comm.Gather([X_local, MPI.DOUBLE_COMPLEX], [gather_buf, MPI.DOUBLE_COMPLEX], root=0)
         
         if self.rank == 0:
-            # gather_buf[src_rank, k1, m] = X[k1, src_rank * block + m]
-            # This is the output for index k = k1 * L + src_rank * block + m
+            if self.debug and block <= 2:
+                print(f"Gather buffer shape: {gather_buf.shape}")
+                for src in range(P):
+                    print(f"From Process {src}:\n{gather_buf[src]}")
+            
+            # Reorder: k = k1*M + k2 where k2 = src_rank*block + m
             result = np.empty(n, dtype=np.complex128)
+            
+            if self.debug and n <= 16:
+                print(f"\nReordering: k = k1*M + k2")
+                print(f"{'Proc':<6} {'k1':<4} {'k2':<4} {'k':<4} {'Value':<30}")
+                print('-'*60)
+            
             for src_rank in range(P):
                 for k1 in range(P):
                     for m in range(block):
-                        k = k1 * L + src_rank * block + m
+                        k2 = src_rank * block + m
+                        k = k1 * M + k2
                         result[k] = gather_buf[src_rank, k1, m]
+                        
+                        if self.debug and n <= 16:
+                            val = gather_buf[src_rank, k1, m]
+                            val_str = f"{val.real:.4f}+{val.imag:.4f}i" if val.imag >= 0 else f"{val.real:.4f}{val.imag:.4f}i"
+                            print(f"{src_rank:<6} {k1:<4} {k2:<4} {k:<4} {val_str:<30}")
+            
+            if self.debug:
+                print(f"\n{'='*70}")
+                print("FINAL RESULT:")
+                print('='*70)
+                print(f"Result: {result}")
+                if n <= 16:
+                    expected = np.fft.fft(x)
+                    print(f"Expected: {expected}")
+                    error = np.max(np.abs(result - expected))
+                    print(f"\nMax error: {error:.2e}")
+                    if error < 1e-10:
+                        print(" RESULT MATCHES NUMPY FFT! ")
+                    else:
+                        print(" RESULT DOES NOT MATCH")
+                        for i in range(n):
+                            match = "[MATCH]" if np.abs(result[i] - expected[i]) < 1e-10 else "[MISMATCH]"
+                            print(f"  [{i}] Result: {result[i]:.6f}, Expected: {expected[i]:.6f} {match}")
+                print('='*70)
+            
             return result
         
         return None
 
-
-    def benchmark(self, x: np.ndarray, iterations: int = 5) -> Tuple[Optional[float], Optional[np.ndarray]]:
-        """Benchmark parallel FFT."""
+    def benchmark(self, x: np.ndarray, iterations: int = 5):
+        """
+        Benchmark parallel FFT.
+        Returns average parallel runtime (max across ranks).
+        """
         times = []
-        result = None
         self.comm.Barrier()
 
         for _ in range(iterations):
+            self.comm.Barrier()
             start = MPI.Wtime()
-            result = self.parallel_fft(x)
+            _ = self.parallel_fft(x)
             self.comm.Barrier()
             end = MPI.Wtime()
+
+            elapsed = end - start
+            max_elapsed = self.comm.reduce(elapsed, op=MPI.MAX, root=0)
+
             if self.rank == 0:
-                times.append(end - start)
+                times.append(max_elapsed)
 
         avg_time = np.mean(times) if self.rank == 0 else None
-        return avg_time, result
+        return avg_time
+
+
+
+# Test script
+if __name__ == "__main__":
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    
+    # Test 1: N=4
+    if rank == 0:
+        print("\n" + "="*70)
+        print("TEST 1: N=4, P=2")
+        print("="*70)
+        x = np.array([1, 2, 3, 4], dtype=np.complex128)
+    else:
+        x = None
+    
+    fft = ParallelFFT(comm, debug=True)
+    result = fft.parallel_fft(x)
+    
+    # Test 2: N=8
+    comm.Barrier()
+    if rank == 0:
+        print("\n\n" + "="*70)
+        print("TEST 2: N=8, P=2")
+        print("="*70)
+        x = np.arange(8, dtype=np.complex128)
+    else:
+        x = None
+    
+    result = fft.parallel_fft(x)
