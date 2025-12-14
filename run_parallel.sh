@@ -26,9 +26,9 @@ fi
 
 # Run the tests
 echo
-echo "Running tests with 4 processes..."
+echo "Running tests with 2 processes..."
 echo "================================="
-mpiexec -n 4 python -m src.test_parallel
+mpiexec -n 2 python -m src.test_parallel
 
 # Check exit status
 if [ $? -eq 0 ]; then
