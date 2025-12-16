@@ -108,16 +108,16 @@ class SerialFFT:
         return np.mean(times), result
 
     
+if __name__ == "__main__":
+    methods = ["FFT", "FFT_vectorized", "numpy"]
 
-# methods = ["FFT", "FFT_vectorized", "numpy"]
-
-# for method in methods:
-#     print(f"\n--- Benchmarking method: {method} ---")
-#     for sizes in [2**i for i in range(4, 25)]:
-#         x = np.random.random(sizes) + 1j * np.random.random(sizes)
-#         avg_time, _ = SerialFFT.benchmark(x, method=method, iterations=5)
-#         print(
-#             f"Method: {method:14s} | "
-#             f"Size: {sizes:6d} (2^{int(math.log2(sizes))}) | "
-#             f"Avg Time: {avg_time:.6f} s"
-#         )
+    for method in methods:
+        print(f"\n--- Benchmarking method: {method} ---")
+        for sizes in [2**i for i in range(4, 27)]:
+            x = np.random.random(sizes) + 1j * np.random.random(sizes)
+            avg_time, _ = SerialFFT.benchmark(x, method=method, iterations=5)
+            print(
+                f"Method: {method:14s} | "
+                f"Size: {sizes:6d} (2^{int(math.log2(sizes))}) | "
+                f"Avg Time: {avg_time:.6f} s"
+            )

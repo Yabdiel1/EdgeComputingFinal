@@ -250,27 +250,42 @@ class ParallelFFT:
 if __name__ == "__main__":
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
-    
-    # Test 1: N=4
-    if rank == 0:
-        print("\n" + "="*70)
-        print("TEST 1: N=4, P=2")
-        print("="*70)
-        x = np.array([1, 2, 3, 4], dtype=np.complex128)
-    else:
-        x = None
-    
-    fft = ParallelFFT(comm, debug=True)
-    result = fft.parallel_fft(x)
-    
-    # Test 2: N=8
-    comm.Barrier()
-    if rank == 0:
-        print("\n\n" + "="*70)
-        print("TEST 2: N=8, P=2")
-        print("="*70)
-        x = np.arange(8, dtype=np.complex128)
-    else:
-        x = None
-    
-    result = fft.parallel_fft(x)
+    size = comm.Get_size()
+
+    N_sizes = [2**i for i in range(10, 27)]
+
+    fft = ParallelFFT(comm, debug=False)
+
+    for N in N_sizes:
+        if rank == 0:
+            print("\n" + "="*70)
+            print(f"TESTING PARALLEL FFT: N={N}, P={size}")
+            print("="*70)
+            x = np.random.random(N) + 1j * np.random.random(N)
+        else:
+            x = None
+
+        # --- Timing ---
+        comm.Barrier()
+        start = MPI.Wtime()
+
+        y_parallel = fft.parallel_fft(x)
+
+        comm.Barrier()
+        end = MPI.Wtime()
+
+        elapsed = end - start
+        max_time = comm.reduce(elapsed, op=MPI.MAX, root=0)
+
+        # --- Correctness check ---
+        if rank == 0:
+            y_numpy = np.fft.fft(x)
+            error = np.max(np.abs(y_parallel - y_numpy))
+
+            print(f"Parallel Time : {max_time:.6f} s")
+            print(f"Max Error     : {error:.2e}")
+
+            if error < 1e-10:
+                print(" Test passed!")
+            else:
+                print(" Test failed!")
